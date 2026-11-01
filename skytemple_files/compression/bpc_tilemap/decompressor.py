@@ -55,10 +55,10 @@ class BpcTilemapDecompressor:
             print("End Phase 1. Begin Phase 2")
             print(f"Cursor begin phase 2: {self.cursor}")
 
-        if self.bytes_written != self.stop_when_size:
+        if self.bytes_written < self.stop_when_size:
             raise ValueError(
                 f"BPC Tilemap Decompressor: Phase1: End result length unexpected. "
-                f"Should be {self.stop_when_size}, is {self.bytes_written} "
+                f"Should be at least {self.stop_when_size}, is {self.bytes_written} "
                 f"Diff: {self.bytes_written - self.stop_when_size}"
             )
 
@@ -68,14 +68,14 @@ class BpcTilemapDecompressor:
         while self.cursor < self.max_size and self.bytes_written < self.stop_when_size:
             self._process_phase2()
 
-        if self.bytes_written != self.stop_when_size:
+        if self.bytes_written < self.stop_when_size:
             raise ValueError(
                 f"BPC Tilemap Decompressor: Phase2: End result length unexpected. "
-                f"Should be {self.stop_when_size}, is {self.bytes_written} "
+                f"Should be at least {self.stop_when_size}, is {self.bytes_written} "
                 f"Diff: {self.bytes_written - self.stop_when_size}"
             )
 
-        return self.decompressed_data
+        return self.decompressed_data[: self.stop_when_size]
 
     def _process_phase1(self):
         if DEBUG:
@@ -121,8 +121,6 @@ class BpcTilemapDecompressor:
             if DEBUG:
                 print(f"READ 0 - WRITE {cmd + 1}")
             self.bytes_written += (cmd + 1) * 2
-            if self.bytes_written > self.stop_when_size:
-                raise ValueError("BPC Tilemap Decompressor: Reached EOF while writing decompressed data.")
         elif CMD_2_SEEK_OFFSET <= cmd < CMD_2_COPY_LOW:
             # cmd - CMD_2_SEEK_OFFSET is the nb of words to write with the next byte as low byte
             cmd_value = self._read()
