@@ -73,12 +73,45 @@ class WanFile(Sir0Serializable):
         return cls(content_data, data_pointer)
 
     def sir0_serialize_parts(self) -> tuple[bytes, list[u32], u32 | None]:
-        raise NotImplementedError()
+        content = bytearray(self._content)
+        pointers = list(self._pointers)
+        for image, locations in zip(self.imgData.imageLists, self._image_locations):
+            for pixels, (descriptor, source, size) in zip(image, locations):
+                if self.is256Color:
+                    raw = bytes(pixels)
+                else:
+                    raw = bytes(pixels[index] | (pixels[index + 1] << 4) for index in range(0, len(pixels), 2))
+                if len(raw) != size:
+                    raise ValueError("The WAN image strip size must remain unchanged.")
+                if source is not None:
+                    content[source : source + size] = raw
+                elif any(raw):
+                    source = len(content)
+                    content.extend(raw)
+                    content[descriptor : descriptor + 4] = source.to_bytes(4, "little")
+                    pointers.append(descriptor)
+        return bytes(content), [u32(offset) for offset in sorted(pointers)], u32(self._header_pointer)
+
+    def to_pil_atlas(self) -> Image.Image:
+        width, height = self.imgData.atlasX, self.imgData.atlasY
+        pixels = bytes(pixel for image in self.imgData.imageLists for strip in image for pixel in strip)
+        image = Image.frombytes("P", (width, height), pixels)
+        image.putpalette([component for palette in self.customPalette for color in palette for component in color[:3]])
+        for region in self.frameData[0]:
+            box = (region.x, region.y, region.x + region.width, region.y + region.height)
+            piece = image.crop(box).point(lambda value: value % 16 + region.paletteIndex * 16)
+            image.paste(piece, box)
+        image.info["transparency"] = bytes(0 if index % 16 == 0 else 255 for index in range(256))
+        return image
 
     # This will accurately load all sir0 found in effect.bin with a few exceptions:
     # effect0268-00289: Not WAN.  Used for screen effects in moves and cutscenes.
     # effect0290-00291: Not Sir0
     def ImportWan(self, data, ptrOffsets, ptrWAN=0):
+        self._content = bytes(data)
+        self._pointers = list(ptrOffsets)
+        self._header_pointer = ptrWAN
+        self._image_locations = []
         in_file = BytesIO()
         in_file.write(data)
         in_file.seek(0)
@@ -91,7 +124,7 @@ class WanFile(Sir0Serializable):
             print("  Null Anim Info and Image Data Info pointer in Wan Header!")
             return None
         self.imgType = int.from_bytes(in_file.read(2), "little")
-        if self.imgType < 1 or self.imgType > 3:
+        if self.imgType < 0 or self.imgType > 3:
             print("  Not an effect! ImgType: {0}".format(self.imgType))
             return None
 
@@ -217,6 +250,7 @@ class WanFile(Sir0Serializable):
                 imgPx.append(pxStrip)
                 imgLists.append(imgPx)
                 self.imgData = ImageData(atlasWidth, atlasHeight, imgLists)
+                self._image_locations = [[(ptrImgs[0], ptrPixSrc, ptrImgs[0] - ptrPixSrc)]]
             else:
                 ##Read CompTable: Read all Image data and assemble; add byte arrays into a list.
                 imgLists = []  # list of imgPx, which is a list of pxStrip, which is a list of bytes
@@ -224,8 +258,10 @@ class WanFile(Sir0Serializable):
                 for ptrImg in ptrImgs:
                     in_file.seek(ptrImg)
                     imgPx = []
+                    locations = []
                     ##Read pixels or zero padding.
                     while True:
+                        descriptor = in_file.tell()
                         ptrPixSrc = int.from_bytes(in_file.read(4), "little")
                         amt = int.from_bytes(in_file.read(2), "little")
                         if ptrPixSrc == 0 and amt == 0:
@@ -234,10 +270,12 @@ class WanFile(Sir0Serializable):
                         updateUnusedStats([], "z-Sort", int.from_bytes(in_file.read(4), "little"))
 
                         pxStrip = []
-                        if ptrImg not in ptrOffsets:
-                            for zero in range(amt):
+                        if descriptor not in ptrOffsets:
+                            locations.append((descriptor, None, amt))
+                            for zero in range(amt if self.is256Color else amt * 2):
                                 pxStrip.append(0)
                         else:
+                            locations.append((descriptor, ptrPixSrc, amt))
                             ptrCurrent = in_file.tell()
                             in_file.seek(ptrPixSrc)
                             for pix in range(amt):
@@ -251,6 +289,7 @@ class WanFile(Sir0Serializable):
                             in_file.seek(ptrCurrent)
                         imgPx.append(pxStrip)
                     imgLists.append(imgPx)
+                    self._image_locations.append(locations)
                 self.imgData = ImageData(0, 0, imgLists)
         else:
             self.is256Color = False
@@ -298,8 +337,22 @@ class WanFile(Sir0Serializable):
             for frame_idx, ptrMetaFrame in enumerate(ptrMetaFrames):
                 in_file.seek(ptrMetaFrame)
                 if self.imgType == 3:
-                    # TODO: research metaframe format for imgtype 3
-                    pass
+                    regions = []
+                    while True:
+                        start = in_file.tell()
+                        palette_offset = int.from_bytes(in_file.read(4), "little")
+                        in_file.seek(start + 0x10)
+                        x = int.from_bytes(in_file.read(2), "little")
+                        y = int.from_bytes(in_file.read(2), "little")
+                        width = int.from_bytes(in_file.read(2), "little")
+                        height = int.from_bytes(in_file.read(2), "little")
+                        in_file.seek(start + 0x22)
+                        last = int.from_bytes(in_file.read(1), "little")
+                        in_file.seek(start + 0x28)
+                        regions.append(AtlasRegion(x, y, width, height, palette_offset // 32))
+                        if last:
+                            break
+                    self.frameData.append(regions)
                 else:
                     metaFrameData = []
                     while True:
@@ -355,6 +408,15 @@ class WanFile(Sir0Serializable):
         else:
             self.frameData = None
             self.animData = None
+
+
+class AtlasRegion:
+    def __init__(self, x, y, width, height, paletteIndex):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.paletteIndex = paletteIndex
 
 
 class ImageData(object):
